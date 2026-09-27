@@ -412,12 +412,93 @@ The sum is over source positions; the 64 value channels remain.
 
 ## 10. All heads in parallel
 
-The batched head tensors are:
+The input to this parallel attention calculation is:
+
+\[
+X_{\text{norm}}\in\mathbb{R}^{B\times T\times C}
+=\mathbb{R}^{2\times8\times768}.
+\]
+
+For one head \(h\), the three learned projection matrices are:
+
+\[
+W_Q^{(h)},W_K^{(h)},W_V^{(h)}
+\in\mathbb{R}^{C\times d_h}
+=\mathbb{R}^{768\times64},
+\]
+
+with biases:
+
+\[
+b_Q^{(h)},b_K^{(h)},b_V^{(h)}
+\in\mathbb{R}^{d_h}
+=\mathbb{R}^{64}.
+\]
+
+For one sequence in the batch, the three multiplications are:
+
+\[
+\underbrace{X_{\text{norm}}[b]}_{8\times768}
+\underbrace{W_Q^{(h)}}_{768\times64}
+\longrightarrow
+\underbrace{Q^{(h)}[b]}_{8\times64},
+\]
+
+\[
+\underbrace{X_{\text{norm}}[b]}_{8\times768}
+\underbrace{W_K^{(h)}}_{768\times64}
+\longrightarrow
+\underbrace{K^{(h)}[b]}_{8\times64},
+\]
+
+\[
+\underbrace{X_{\text{norm}}[b]}_{8\times768}
+\underbrace{W_V^{(h)}}_{768\times64}
+\longrightarrow
+\underbrace{V^{(h)}[b]}_{8\times64}.
+\]
+
+Including the batch axis:
+
+\[
+Q^{(h)},K^{(h)},V^{(h)}
+\in\mathbb{R}^{B\times T\times d_h}
+=\mathbb{R}^{2\times8\times64}.
+\]
+
+The implementation fuses all three projections and all heads. Its mathematical
+weight has shape:
+
+\[
+W_{QKV}\in\mathbb{R}^{C\times3C}
+=\mathbb{R}^{768\times2304}.
+\]
+
+The fused multiplication is:
+
+\[
+\underbrace{X_{\text{norm}}}_{2\times8\times768}
+\underbrace{W_{QKV}}_{768\times2304}
+\longrightarrow
+\underbrace{QKV}_{2\times8\times2304}.
+\]
+
+Splitting the final \(2304\) dimension into three \(768\)-wide sections gives
+Q, K, and V. Reshaping each \(768\) into \(12\times64\) gives the batched head
+tensors:
 
 \[
 Q\in\mathbb{R}^{B\times H\times T\times d_h},
 \qquad
 K^\top\in\mathbb{R}^{B\times H\times d_h\times T}.
+\]
+
+Numerically:
+
+\[
+Q,K,V\in\mathbb{R}^{2\times12\times8\times64},
+\qquad
+K^\top\in\mathbb{R}^{2\times12\times64\times8}.
 \]
 
 Therefore:
@@ -428,11 +509,46 @@ QK^\top
 =\mathbb{R}^{2\times12\times8\times8}.
 \]
 
+The multiplication contracts the \(64\)-wide head dimension:
+
+\[
+\underbrace{Q}_{2\times12\times8\times64}
+\underbrace{K^\top}_{2\times12\times64\times8}
+\longrightarrow
+\underbrace{QK^\top}_{2\times12\times8\times8}.
+\]
+
+For every batch item \(b\), head \(h\), target position \(t\), and source
+position \(s\):
+
+\[
+(QK^\top)_{b,h,t,s}
+=\sum_{i=1}^{64}Q_{b,h,t,i}K_{b,h,s,i}.
+\]
+
 There are \(H=12\) independent \(8\times8\) score matrices per batch item.
 The head axis makes them coexist in one tensor; heads do not multiply each
 other's scores.
 
 After value mixing:
+
+\[
+\underbrace{A}_{2\times12\times8\times8}
+\underbrace{V}_{2\times12\times8\times64}
+\longrightarrow
+\underbrace{AV}_{2\times12\times8\times64}
+\]
+
+Equivalently, for one head:
+
+\[
+\underbrace{A^{(h)}}_{2\times8\times8}
+\underbrace{V^{(h)}}_{2\times8\times64}
+\longrightarrow
+\underbrace{O^{(h)}}_{2\times8\times64}.
+\]
+
+For all heads:
 
 \[
 AV
@@ -720,6 +836,35 @@ It is not \(8+768\). The tensor has three axes:
 
 For one batch item alone, the matrix is \(8\times768\). For the complete
 batch, it is \(2\times8\times768\).
+
+### Dimension ledger before attention
+
+The following table separates the object being multiplied, the weight, and the
+result. The \(T\times C\) notation is a matrix shape; it is not an addition.
+
+| object | mathematical shape | GPT-2-small shape |
+|---|---|---|
+| normalized input \(X_{\text{norm}}\) | \(B\times T\times C\) | \(2\times8\times768\) |
+| one sequence \(X_{\text{norm}}[b]\) | \(T\times C\) | \(8\times768\) |
+| one token row \(X_{\text{norm}}[b,t]\) | \(C\) | \(768\) |
+| one-head \(W_Q^{(h)},W_K^{(h)},W_V^{(h)}\) | \(C\times d_h\) | \(768\times64\) |
+| fused \(W_{QKV}\) | \(C\times3C\) | \(768\times2304\) |
+| one-head \(Q^{(h)},K^{(h)},V^{(h)}\) | \(B\times T\times d_h\) | \(2\times8\times64\) |
+| all-head \(Q,K,V\) after reshape | \(B\times H\times T\times d_h\) | \(2\times12\times8\times64\) |
+| one-head scores | \(B\times T\times T\) | \(2\times8\times8\) |
+| all-head scores | \(B\times H\times T\times T\) | \(2\times12\times8\times8\) |
+
+For example, the one-head query operation is exactly:
+
+$$
+\underbrace{X_{\text{norm}}[b]}_{8\times768}
+\underbrace{W_Q^{(h)}}_{768\times64}
+\longrightarrow
+\underbrace{Q^{(h)}[b]}_{8\times64}.
+$$
+
+The inner \(768\) dimensions are contracted. The remaining dimensions are the
+eight sequence positions and the 64 channels belonging to that head.
 
 ### 16.1 First LayerNorm
 

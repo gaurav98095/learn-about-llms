@@ -7,6 +7,81 @@ becomes many heads.
 The runnable example is [1.py](1.py). It uses smaller dimensions, but every
 operation is the same as GPT-2 small.
 
+## Complete GPT-2 architecture
+
+This is the whole system in one view. The large middle section is one
+pre-normalized Transformer block; GPT-2 repeats that block 12 times.
+
+~~~~mermaid
+flowchart TB
+    text["Text"] --> tok["Tokenizer<br/>byte-level BPE"]
+    tok --> ids["Token IDs<br/>(B, T)"]
+
+    subgraph INPUT["Input representation"]
+        ids --> te["Token embedding<br/>W_token: (V, C)"]
+        pos["Position IDs<br/>(T)"] --> pe["Position embedding<br/>W_pos: (T_max, C)"]
+        te --> add0((" + "))
+        pe --> add0
+        add0 --> x0["Initial residual stream<br/>(B, T, C)"]
+    end
+
+    subgraph BLOCK["One GPT-2 pre-norm Transformer block"]
+        x0b["Block input<br/>(B, T, C)"] --> ln1["LayerNorm<br/>(B, T, C)"]
+        ln1 --> qkv["Fused QKV projection<br/>C → 3C<br/>(B, T, 3C)"]
+        qkv --> split["Split Q, K, V<br/>3 × (B, T, C)"]
+        split --> heads["Reshape into H heads<br/>Q, K, V: (B, H, T, d_h)"]
+        heads --> scores["QKᵀ / √d_h<br/>(B, H, T, T)"]
+        scores --> mask["Causal mask<br/>future positions = −∞"]
+        mask --> probs["Softmax over source positions<br/>attention weights"]
+        probs --> values["Attention weights × V<br/>(B, H, T, d_h)"]
+        values --> concat["Transpose + concatenate heads<br/>(B, T, H·d_h) = (B, T, C)"]
+        concat --> proj["Output projection<br/>C → C"]
+        proj --> add1((" + "))
+        x0b --> add1
+        add1 --> ln2["LayerNorm<br/>(B, T, C)"]
+        ln2 --> fc1["MLP expansion<br/>C → 4C"]
+        fc1 --> gelu["GELU<br/>(B, T, 4C)"]
+        gelu --> fc2["MLP contraction<br/>4C → C"]
+        fc2 --> add2((" + "))
+        add1 --> add2
+        add2 --> xb["Block output<br/>(B, T, C)"]
+    end
+
+    x0 --> x0b
+    xb --> repeat["Repeat blocks 2–12<br/>same shapes, different weights"]
+    repeat --> final["Final LayerNorm<br/>(B, T, C)"]
+    final --> lm["Tied vocabulary projection<br/>C → V"]
+    lm --> logits["Logits<br/>(B, T, V)"]
+
+    logits --> train["Training:<br/>cross-entropy with shifted targets"]
+    logits --> last["Generation:<br/>take last position (B, V)"]
+    last --> sample["Temperature / top-k / sampling"]
+    sample --> next["Next token<br/>(B, 1)"]
+    next -. append to context .-> ids
+
+    classDef data fill:#e8f4ff,stroke:#2878b5,stroke-width:1px
+    classDef op fill:#fff4d6,stroke:#b87900,stroke-width:1px
+    classDef attention fill:#f0e6ff,stroke:#7445a8,stroke-width:1px
+    classDef output fill:#e6f7e9,stroke:#31834b,stroke-width:1px
+    class ids,te,pe,x0,x0b,xb,repeat,logits,next data
+    class ln1,ln2,qkv,split,concat,proj,fc1,gelu,fc2,final,lm op
+    class heads,scores,mask,probs,values attention
+    class train,last,sample output
+~~~~
+
+The shape story is:
+
+\[
+(B,T)
+\longrightarrow
+(B,T,C)
+\longrightarrow
+\underbrace{(B,T,C)\longrightarrow\cdots\longrightarrow(B,T,C)}
+_{\text{12 Transformer blocks}}
+\longrightarrow
+(B,T,V).
+\]
+
 ## 1. Configuration and notation
 
 GPT-2 small uses:
